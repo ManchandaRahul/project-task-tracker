@@ -3,6 +3,7 @@ import express from 'express';
 import { neon } from '@neondatabase/serverless';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -10,6 +11,94 @@ const sql = process.env.DATABASE_URL ? neon(process.env.DATABASE_URL) : null;
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const statuses = ['Not Started', 'Assigned', 'In Progress', 'Under Review', 'On Hold', 'Blocked', 'Completed'];
 app.use(express.json());
+
+const sessionCookie = 'project_hub_session';
+const sessionLifetimeMs = 7 * 24 * 60 * 60 * 1000;
+const demoSessions = new Map();
+const loginAttempts = new Map();
+
+function publicUser(user) {
+  if (!user) return null;
+  const { password_hash, password_salt, ...safe } = user;
+  return safe;
+}
+function passwordRecord(password) {
+  const salt = randomBytes(16).toString('hex');
+  return { salt, hash: scryptSync(password, salt, 64).toString('hex') };
+}
+function passwordMatches(password, user) {
+  if (!user?.password_hash || !user?.password_salt) return false;
+  const actual = scryptSync(password, user.password_salt, 64);
+  const expected = Buffer.from(user.password_hash, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+function tokenHash(token) { return createHash('sha256').update(token).digest('hex'); }
+function cookieValue(req, name) {
+  const entry = (req.headers.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
+  return entry ? decodeURIComponent(entry.slice(name.length + 1)) : '';
+}
+function setSessionCookie(res, token) {
+  const secure = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+  res.cookie(sessionCookie, token, { httpOnly: true, sameSite: 'lax', secure, maxAge: sessionLifetimeMs, path: '/' });
+}
+function clearSessionCookie(res) {
+  const secure = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+  res.clearCookie(sessionCookie, { httpOnly: true, sameSite: 'lax', secure, path: '/' });
+}
+async function ensureInitialAdmin() {
+  const email = (process.env.ADMIN_EMAIL || 'admin@abc.com').trim().toLowerCase();
+  const password = process.env.ADMIN_INITIAL_PASSWORD;
+  if (!password || password.length < 12) return false;
+  if (!sql) {
+    const user = demo.users.find((item) => item.email.toLowerCase() === email && item.role === 'Admin');
+    if (!user) return false;
+    if (!user.password_hash) { const record = passwordRecord(password); user.password_hash = record.hash; user.password_salt = record.salt; }
+    return true;
+  }
+  const users = await sql`SELECT * FROM app_users WHERE lower(email) = ${email} AND role = 'Admin' LIMIT 1`;
+  const user = users[0];
+  if (!user) return false;
+  if (!user.password_hash) {
+    const record = passwordRecord(password);
+    await sql`UPDATE app_users SET password_hash = ${record.hash}, password_salt = ${record.salt} WHERE id = ${user.id} AND password_hash IS NULL`;
+  }
+  return true;
+}
+async function initialAdminReady() {
+  const email = (process.env.ADMIN_EMAIL || 'admin@abc.com').trim().toLowerCase();
+  if (!sql) return Boolean(demo.users.find((item) => item.email.toLowerCase() === email && item.role === 'Admin')?.password_hash);
+  const [user] = await sql`SELECT password_hash FROM app_users WHERE lower(email) = ${email} AND role = 'Admin' AND is_active = TRUE LIMIT 1`;
+  return Boolean(user?.password_hash);
+}
+async function userFromRequest(req) {
+  const token = cookieValue(req, sessionCookie);
+  if (!token) return null;
+  const hash = tokenHash(token);
+  if (!sql) {
+    const session = demoSessions.get(hash);
+    if (!session || session.expires_at <= Date.now()) { demoSessions.delete(hash); return null; }
+    return publicUser(demo.users.find((item) => item.id === session.user_id && item.is_active));
+  }
+  const rows = await sql`SELECT u.id, u.name, u.email, u.department, u.role, u.reporting_manager, u.is_active, u.created_at
+    FROM app_sessions s JOIN app_users u ON u.id = s.user_id
+    WHERE s.token_hash = ${hash} AND s.expires_at > now() AND u.is_active = TRUE LIMIT 1`;
+  return rows[0] || null;
+}
+async function requireAuth(req, res, next) {
+  try {
+    req.user = await userFromRequest(req);
+    if (!req.user) return res.status(401).json({ error: 'Please sign in to continue.' });
+    next();
+  } catch (error) { res.status(500).json({ error: 'Unable to verify the current session.', detail: error.message }); }
+}
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'Admin') return res.status(403).json({ error: 'Administrator access is required.' });
+  next();
+}
+function requireManager(req, res, next) {
+  if (!['Admin', 'Project Manager'].includes(req.user?.role)) return res.status(403).json({ error: 'Project manager access is required.' });
+  next();
+}
 
 let demo = {
   projects: [
@@ -37,7 +126,7 @@ let demo = {
     { id: 'USR-002', name: 'Alex Rivera', email: 'alex.rivera@example.com', department: 'Engineering', role: 'Team Member', reporting_manager: 'Sarah Johnson', is_active: true },
     { id: 'USR-003', name: 'Emma Stone', email: 'emma.stone@example.com', department: 'Security', role: 'Team Member', reporting_manager: 'Sarah Johnson', is_active: true },
     { id: 'USR-004', name: 'Dave Miller', email: 'dave.miller@example.com', department: 'Engineering', role: 'Team Member', reporting_manager: 'Sarah Johnson', is_active: true },
-    { id: 'USR-005', name: 'Marcus Vance', email: 'marcus.vance@example.com', department: 'Engineering', role: 'Admin', reporting_manager: '', is_active: true }
+    { id: 'USR-005', name: 'Marcus Vance', email: 'admin@abc.com', department: 'Engineering', role: 'Admin', reporting_manager: '', is_active: true }
   ],
   notifications: [],
   reminders: [],
@@ -84,7 +173,7 @@ async function loadData() {
     sql`SELECT * FROM projects ORDER BY id`, sql`SELECT * FROM tasks ORDER BY due_date`, sql`SELECT * FROM task_dependencies`,
     sql`SELECT * FROM task_user_dependencies ORDER BY id`,
     sql`SELECT * FROM issues ORDER BY created_at DESC`, sql`SELECT * FROM reminder_log ORDER BY sent_at DESC LIMIT 40`,
-    sql`SELECT * FROM app_users WHERE is_active = TRUE ORDER BY name`, sql`SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100`,
+    sql`SELECT id, name, email, department, role, reporting_manager, is_active, created_at FROM app_users WHERE is_active = TRUE ORDER BY name`, sql`SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100`,
     sql`SELECT * FROM activity ORDER BY occurred_at DESC LIMIT 8`
   ]);
   const dependencyMap = new Map();
@@ -197,12 +286,77 @@ function scheduleDailyNotifications() {
   }, 60 * 1000);
 }
 
-app.get('/api/dashboard', async (_req, res) => { try { const data = await loadData(); res.json({ ...data, followUp: followUpBuckets(data.tasks), statuses }); } catch (error) { res.status(500).json({ error: 'Unable to load project data', detail: error.message }); } });
-app.get('/api/follow-up', async (_req, res) => { try { const data = await loadData(); res.json(followUpBuckets(data.tasks)); } catch (error) { res.status(500).json({ error: error.message }); } });
-app.get('/api/reminders', async (_req, res) => { try { const data = await loadData(); res.json(data.reminders); } catch (error) { res.status(500).json({ error: error.message }); } });
-app.get('/api/issues', async (_req, res) => { try { const data = await loadData(); res.json(data.issues); } catch (error) { res.status(500).json({ error: error.message }); } });
-app.post('/api/notifications/run-daily', async (req, res) => { if (!req.body.projectId) return res.status(400).json({ error: 'Select a project.' }); try { res.json(await runProjectDailyNotifications(req.body.projectId)); } catch (error) { res.status(error.statusCode || 500).json({ error: error.message }); } });
-app.patch('/api/projects/:id/notification-settings', async (req, res) => {
+function scopeData(data, user) {
+  if (user.role === 'Admin') return data;
+  const ownedTasks = data.tasks.filter((item) => item.assignee.toLowerCase() === user.name.toLowerCase());
+  const projectIds = new Set(ownedTasks.map((item) => item.project_id));
+  if (user.role === 'Project Manager') data.projects.filter((item) => item.manager.toLowerCase() === user.name.toLowerCase()).forEach((item) => projectIds.add(item.id));
+  const tasks = user.role === 'Project Manager' ? data.tasks.filter((item) => projectIds.has(item.project_id)) : ownedTasks;
+  const taskIds = new Set(tasks.map((item) => item.id));
+  const projects = data.projects.filter((item) => projectIds.has(item.id));
+  const projectNames = new Set(projects.map((item) => item.name));
+  return {
+    ...data,
+    projects,
+    tasks,
+    issues: data.issues.filter((item) => projectIds.has(item.project_id)),
+    reminders: data.reminders.filter((item) => taskIds.has(item.task_id)),
+    users: user.role === 'Project Manager' ? data.users : data.users.filter((item) => item.id === user.id),
+    notifications: data.notifications.filter((item) => item.user_id === user.id),
+    activity: data.activity.filter((item) => projectNames.has(item.project_name))
+  };
+}
+
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    await ensureInitialAdmin();
+    res.json({ user: await userFromRequest(req), initialAdminConfigured: await initialAdminReady() });
+  } catch (error) { res.status(500).json({ error: 'Unable to check authentication.', detail: error.message }); }
+});
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const attemptKey = `${req.ip}:${email}`;
+  const recent = (loginAttempts.get(attemptKey) || []).filter((time) => Date.now() - time < 15 * 60 * 1000);
+  if (recent.length >= 5) return res.status(429).json({ error: 'Too many sign-in attempts. Try again in 15 minutes.' });
+  try {
+    await ensureInitialAdmin();
+    const user = sql ? (await sql`SELECT * FROM app_users WHERE lower(email) = ${email} AND is_active = TRUE LIMIT 1`)[0] : demo.users.find((item) => item.email.toLowerCase() === email && item.is_active);
+    if (!user || !passwordMatches(password, user)) {
+      loginAttempts.set(attemptKey, [...recent, Date.now()]);
+      return res.status(401).json({ error: 'Email or password is incorrect.' });
+    }
+    loginAttempts.delete(attemptKey);
+    const token = randomBytes(32).toString('base64url');
+    const hash = tokenHash(token);
+    const expiresAt = new Date(Date.now() + sessionLifetimeMs);
+    if (sql) await sql`INSERT INTO app_sessions (token_hash, user_id, expires_at) VALUES (${hash}, ${user.id}, ${expiresAt.toISOString()})`;
+    else demoSessions.set(hash, { user_id: user.id, expires_at: expiresAt.getTime() });
+    setSessionCookie(res, token);
+    res.json({ user: publicUser(user) });
+  } catch (error) { res.status(500).json({ error: 'Unable to sign in.', detail: error.message }); }
+});
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const token = cookieValue(req, sessionCookie);
+    if (token) {
+      const hash = tokenHash(token);
+      if (sql) await sql`DELETE FROM app_sessions WHERE token_hash = ${hash}`;
+      else demoSessions.delete(hash);
+    }
+    clearSessionCookie(res);
+    res.status(204).end();
+  } catch (error) { res.status(500).json({ error: 'Unable to sign out.', detail: error.message }); }
+});
+
+app.use('/api', requireAuth);
+
+app.get('/api/dashboard', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json({ ...data, currentUser: req.user, followUp: followUpBuckets(data.tasks), statuses }); } catch (error) { res.status(500).json({ error: 'Unable to load project data', detail: error.message }); } });
+app.get('/api/follow-up', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json(followUpBuckets(data.tasks)); } catch (error) { res.status(500).json({ error: error.message }); } });
+app.get('/api/reminders', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json(data.reminders); } catch (error) { res.status(500).json({ error: error.message }); } });
+app.get('/api/issues', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json(data.issues); } catch (error) { res.status(500).json({ error: error.message }); } });
+app.post('/api/notifications/run-daily', requireAdmin, async (req, res) => { if (!req.body.projectId) return res.status(400).json({ error: 'Select a project.' }); try { res.json(await runProjectDailyNotifications(req.body.projectId)); } catch (error) { res.status(error.statusCode || 500).json({ error: error.message }); } });
+app.patch('/api/projects/:id/notification-settings', requireAdmin, async (req, res) => {
   const enabled = req.body.enabled;
   const notificationTime = req.body.notificationTime || '09:00';
   if (typeof enabled !== 'boolean' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(notificationTime)) return res.status(400).json({ error: 'Provide a valid schedule and time.' });
@@ -212,15 +366,24 @@ app.patch('/api/projects/:id/notification-settings', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Project not found.' }); res.json(normaliseProjectDates(updated));
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', requireAdmin, async (req, res) => {
   const user = { id: req.body.id || `USR-${String(Date.now()).slice(-5)}`, name: req.body.name?.trim(), email: req.body.email?.trim().toLowerCase(), department: req.body.department?.trim(), role: req.body.role, reporting_manager: req.body.reportingManager?.trim() || '' };
+  const password = String(req.body.password || '');
   if (!user.name || !user.email || !user.department || !['Admin', 'Project Manager', 'Team Member', 'Stakeholder'].includes(user.role)) return res.status(400).json({ error: 'Complete the required user fields.' });
-  try { if (!sql) { if (demo.users.some((item) => item.email === user.email)) return res.status(409).json({ error: 'A user already has this email.' }); const created = { ...user, is_active: true }; demo.users.push(created); return res.status(201).json(created); } const [created] = await sql`INSERT INTO app_users (id, name, email, department, role, reporting_manager) VALUES (${user.id}, ${user.name}, ${user.email}, ${user.department}, ${user.role}, ${user.reporting_manager}) RETURNING *`; res.status(201).json(created); } catch (error) { res.status(500).json({ error: error.message }); }
+  if (password.length < 12) return res.status(400).json({ error: 'The initial password must contain at least 12 characters.' });
+  const record = passwordRecord(password);
+  try { if (!sql) { if (demo.users.some((item) => item.email === user.email)) return res.status(409).json({ error: 'A user already has this email.' }); const created = { ...user, is_active: true, password_hash: record.hash, password_salt: record.salt }; demo.users.push(created); return res.status(201).json(publicUser(created)); } const [created] = await sql`INSERT INTO app_users (id, name, email, department, role, reporting_manager, password_hash, password_salt) VALUES (${user.id}, ${user.name}, ${user.email}, ${user.department}, ${user.role}, ${user.reporting_manager}, ${record.hash}, ${record.salt}) RETURNING id, name, email, department, role, reporting_manager, is_active, created_at`; res.status(201).json(created); } catch (error) { res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'A user already has this email.' : error.message }); }
 });
 
-app.post('/api/tasks', async (req, res) => {
+app.post('/api/tasks', requireManager, async (req, res) => {
   const body = normaliseTask(req.body); if (!body.valid) return res.status(400).json({ error: body.error });
   try {
+    body.task.assigned_by = req.user.name;
+    if (req.user.role === 'Project Manager') {
+      const project = sql ? (await sql`SELECT manager FROM projects WHERE id = ${body.task.project_id} LIMIT 1`)[0] : demo.projects.find((item) => item.id === body.task.project_id);
+      if (!project) return res.status(404).json({ error: 'Project not found.' });
+      if (project.manager.toLowerCase() !== req.user.name.toLowerCase()) return res.status(403).json({ error: 'You can create tasks only in projects you manage.' });
+    }
     if (!sql) {
       const created = { ...body.task, user_dependencies: body.task.user_dependency ? [body.task.user_dependency] : [] };
       demo.tasks.push(created);
@@ -238,17 +401,24 @@ app.patch('/api/tasks/:id', async (req, res) => {
   const { status, progress, actualHours, nextFollowUp, remarks } = req.body;
   if (status && !statuses.includes(status)) return res.status(400).json({ error: 'Invalid status.' });
   try {
+    if (req.user.role !== 'Admin') {
+      const existing = sql ? (await sql`SELECT t.assignee, p.manager FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ${req.params.id} LIMIT 1`)[0] : (() => { const task = demo.tasks.find((item) => item.id === req.params.id); const project = task && demo.projects.find((item) => item.id === task.project_id); return task ? { assignee: task.assignee, manager: project?.manager || '' } : null; })();
+      if (!existing) return res.status(404).json({ error: 'Task not found.' });
+      const ownsTask = existing.assignee.toLowerCase() === req.user.name.toLowerCase();
+      const managesProject = req.user.role === 'Project Manager' && existing.manager.toLowerCase() === req.user.name.toLowerCase();
+      if (!ownsTask && !managesProject) return res.status(403).json({ error: 'You can update only your assigned tasks or projects you manage.' });
+    }
     if (!sql) { const index = demo.tasks.findIndex((item) => item.id === req.params.id); if (index < 0) return res.status(404).json({ error: 'Task not found.' }); demo.tasks[index] = { ...demo.tasks[index], ...(status ? { status } : {}), ...(progress !== undefined ? { progress: Number(progress) } : {}), ...(actualHours !== undefined ? { actual_hours: Number(actualHours) } : {}), ...(nextFollowUp ? { next_follow_up: nextFollowUp } : {}), ...(remarks !== undefined ? { remarks } : {}) }; return res.json(demo.tasks[index]); }
     const [updated] = await sql`UPDATE tasks SET status = COALESCE(${status || null}, status), progress = COALESCE(${progress ?? null}, progress), actual_hours = COALESCE(${actualHours ?? null}, actual_hours), next_follow_up = COALESCE(${nextFollowUp || null}, next_follow_up), remarks = COALESCE(${remarks ?? null}, remarks) WHERE id = ${req.params.id} RETURNING *`;
     if (!updated) return res.status(404).json({ error: 'Task not found.' }); res.json(normaliseTaskDates(updated));
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 app.post('/api/issues', async (req, res) => {
-  const issue = { id: req.body.id || `ISS-${String(Date.now()).slice(-5)}`, ...req.body, resolution_date: req.body.resolutionDate || null };
+  const issue = { id: req.body.id || `ISS-${String(Date.now()).slice(-5)}`, ...req.body, raised_by: req.user.name, resolution_date: req.body.resolutionDate || null };
   if (!issue.project_id || !issue.title || !issue.raised_by || !issue.owner || !issue.priority) return res.status(400).json({ error: 'Missing required issue fields.' });
   try { if (!sql) { demo.issues.unshift(issue); return res.status(201).json(issue); } const [created] = await sql`INSERT INTO issues (id, project_id, task_id, title, description, raised_by, owner, priority, status, resolution_date) VALUES (${issue.id}, ${issue.project_id}, ${issue.task_id || null}, ${issue.title}, ${issue.description || ''}, ${issue.raised_by}, ${issue.owner}, ${issue.priority}, ${issue.status || 'Open'}, ${issue.resolution_date}) RETURNING *`; res.status(201).json(normaliseIssueDates(created)); } catch (error) { res.status(500).json({ error: error.message }); }
 });
-app.post('/api/automation/run', async (_req, res) => { try { res.json(await runAutomation()); } catch (error) { res.status(500).json({ error: error.message }); } });
+app.post('/api/automation/run', requireAdmin, async (_req, res) => { try { res.json(await runAutomation()); } catch (error) { res.status(500).json({ error: error.message }); } });
 
 function normaliseTask(input) {
   const has_task_dependencies = input.hasTaskDependencies === true || input.hasTaskDependencies === 'true';

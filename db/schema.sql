@@ -82,6 +82,19 @@ CREATE TABLE IF NOT EXISTS app_users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_salt TEXT;
+
+CREATE TABLE IF NOT EXISTS app_sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS app_sessions_user_id_idx ON app_sessions(user_id);
+CREATE INDEX IF NOT EXISTS app_sessions_expires_at_idx ON app_sessions(expires_at);
+
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS daily_follow_up_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -161,7 +174,7 @@ INSERT INTO app_users (id, name, email, department, role, reporting_manager) VAL
   ('USR-002', 'Alex Rivera', 'alex.rivera@example.com', 'Engineering', 'Team Member', 'Sarah Johnson'),
   ('USR-003', 'Emma Stone', 'emma.stone@example.com', 'Security', 'Team Member', 'Sarah Johnson'),
   ('USR-004', 'Dave Miller', 'dave.miller@example.com', 'Engineering', 'Team Member', 'Sarah Johnson'),
-  ('USR-005', 'Marcus Vance', 'marcus.vance@example.com', 'Engineering', 'Admin', '')
+  ('USR-005', 'Marcus Vance', 'admin@abc.com', 'Engineering', 'Admin', '')
 ON CONFLICT (id) DO NOTHING;
 UPDATE tasks SET daily_follow_up_enabled = TRUE WHERE id IN ('TSK-010', 'TSK-013', 'TSK-016');
 INSERT INTO issues (id, project_id, task_id, title, description, raised_by, owner, priority, status) VALUES
