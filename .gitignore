@@ -6,3 +6,6 @@ dist/
 *.log
 .tmp-doc-review/
 New Text Document.txt
+
+.vercel
+.env*.local
