@@ -431,7 +431,15 @@ function normaliseTask(input) {
   return { valid: true, task };
 }
 
-scheduleDailyNotifications();
 app.use(express.static(path.join(rootDir, 'dist')));
 app.use((req, res, next) => { if (req.method === 'GET' && req.accepts('html')) return res.sendFile(path.join(rootDir, 'dist', 'index.html')); next(); });
-app.listen(port, () => console.log(`Project Hub API listening on http://localhost:${port}`));
+
+let localServer;
+export function startServer() {
+  if (localServer) return localServer;
+  scheduleDailyNotifications();
+  localServer = app.listen(port, () => console.log(`Project Hub API listening on http://localhost:${port}`));
+  return localServer;
+}
+
+export default app;

@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"node server/index.js\"",
+    "dev": "concurrently \"vite\" \"node server.js\"",
     "build": "vite build",
-    "start": "node server/index.js",
+    "start": "node server.js",
     "smoke": "node smoke-check.mjs"
   },
   "dependencies": {
