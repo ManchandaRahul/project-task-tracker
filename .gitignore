@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+*.log
+.tmp-doc-review/
+New Text Document.txt
