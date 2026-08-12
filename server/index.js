@@ -351,6 +351,29 @@ app.post('/api/auth/logout', async (req, res) => {
 
 app.use('/api', requireAuth);
 
+app.patch('/api/auth/profile', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const newPassword = String(req.body.newPassword || '');
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Provide a valid email address.' });
+  if (newPassword && newPassword.length < 12) return res.status(400).json({ error: 'A new password must contain at least 12 characters.' });
+  try {
+    if (!sql) {
+      if (demo.users.some((item) => item.id !== req.user.id && item.email.toLowerCase() === email)) return res.status(409).json({ error: 'Another user already has this email address.' });
+      const user = demo.users.find((item) => item.id === req.user.id);
+      user.email = email;
+      if (newPassword) { const record = passwordRecord(newPassword); user.password_hash = record.hash; user.password_salt = record.salt; }
+      return res.json(publicUser(user));
+    }
+    const duplicate = await sql`SELECT id FROM app_users WHERE lower(email) = ${email} AND id <> ${req.user.id} LIMIT 1`;
+    if (duplicate[0]) return res.status(409).json({ error: 'Another user already has this email address.' });
+    const password = newPassword ? passwordRecord(newPassword) : null;
+    const [updated] = password
+      ? await sql`UPDATE app_users SET email = ${email}, password_hash = ${password.hash}, password_salt = ${password.salt} WHERE id = ${req.user.id} RETURNING id, name, email, department, role, reporting_manager, is_active, created_at`
+      : await sql`UPDATE app_users SET email = ${email} WHERE id = ${req.user.id} RETURNING id, name, email, department, role, reporting_manager, is_active, created_at`;
+    res.json(updated);
+  } catch (error) { res.status(500).json({ error: 'Unable to update profile.', detail: error.message }); }
+});
+
 app.get('/api/dashboard', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json({ ...data, currentUser: req.user, followUp: followUpBuckets(data.tasks), statuses }); } catch (error) { res.status(500).json({ error: 'Unable to load project data', detail: error.message }); } });
 app.get('/api/follow-up', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json(followUpBuckets(data.tasks)); } catch (error) { res.status(500).json({ error: error.message }); } });
 app.get('/api/reminders', async (req, res) => { try { const data = scopeData(await loadData(), req.user); res.json(data.reminders); } catch (error) { res.status(500).json({ error: error.message }); } });
